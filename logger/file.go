@@ -15,6 +15,17 @@ type FileLogger struct {
 	fileObj     *os.File
 	errFileObj  *os.File
 	maxFileSize int64
+	logChan     chan *LogMsg
+}
+
+// LogMsg ...
+type LogMsg struct {
+	level     LogLevel
+	message   string
+	funcname  string
+	filename  string
+	timestamp string
+	line      int
 }
 
 // NewFileLogger ...
@@ -33,16 +44,56 @@ func NewFileLogger(lv, fp, fn string, maxSize int64) *FileLogger {
 	if err != nil {
 		fmt.Println("open errfile err:", err)
 	}
-	return &FileLogger{
+	logc := make(chan *LogMsg, 5000)
+	f1 := &FileLogger{
 		level:       level,
 		filepath:    fp,
 		filename:    fn,
 		fileObj:     fo,
 		errFileObj:  efo,
 		maxFileSize: maxSize,
+		logChan:     logc,
+	}
+	go f1.writeTofile()
+	return f1
+}
+
+func (log *FileLogger) writeTofile() {
+	for {
+		// 判断日志大小是否已经超过规定大小
+		if log.checkFileSize(log.fileObj) {
+			// 切分日志
+			newFile, err := log.splitLogFile(log.fileObj)
+			if err != nil {
+				fmt.Println("log.splitLogFile ", err)
+				return
+			}
+			log.fileObj = newFile
+		}
+		select {
+		case logmsg := <-log.logChan:
+			logInfo := fmt.Sprintf("[%s] [%s] [%s:%s:%d] %s\n", logmsg.timestamp, levelName(logmsg.level), logmsg.filename, logmsg.funcname, logmsg.line, logmsg.message)
+			fmt.Fprintf(log.fileObj, logInfo)
+			if logmsg.level >= ERROR {
+				// 判断日志大小是否已经超过规定大小
+				if log.checkFileSize(log.errFileObj) {
+					// 切分日志
+					newErrFile, err := log.splitLogFile(log.errFileObj)
+					if err != nil {
+						fmt.Println("log.splitNewLogFile ", err)
+						return
+					}
+					log.errFileObj = newErrFile
+				}
+				fmt.Fprintf(log.errFileObj, logInfo)
+			}
+		default:
+			time.Sleep(time.Millisecond * 500)
+		}
 	}
 }
 
+// levelEnable ...
 func (log *FileLogger) levelEnable(level LogLevel) bool {
 	return level > log.level
 }
@@ -51,13 +102,14 @@ func (log *FileLogger) levelEnable(level LogLevel) bool {
 func (log *FileLogger) checkFileSize(file *os.File) bool {
 	fileinfo, err := file.Stat()
 	if err != nil {
-		panic(err)
+		fmt.Println("file.Stat error ", err)
+		return false
 	}
 	return fileinfo.Size() >= log.maxFileSize
 }
 
 // 切分日志
-func (log *FileLogger) splitLogFile(file *os.File) *os.File {
+func (log *FileLogger) splitLogFile(file *os.File) (*os.File, error) {
 	oldpath := path.Join(log.filepath, log.filename)
 	now := time.Now().Format("20060102150405000")
 	newpath := oldpath + ".bak" + now
@@ -66,31 +118,31 @@ func (log *FileLogger) splitLogFile(file *os.File) *os.File {
 	// 创建新的日志文件
 	newFile, err := os.OpenFile(oldpath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
 	file.Close()
-	return newFile
+	return newFile, nil
 }
 
 func (log *FileLogger) writeLog(level LogLevel, format string, a ...interface{}) {
 	if log.levelEnable(level) {
 		msg := fmt.Sprintf(format, a...)
-		new := time.Now()
 		funcname, filename, line := logDetail(1)
-		// 判断日志大小是否已经超过规定大小
-		if log.checkFileSize(log.fileObj) {
-			// 切分日志
-			log.fileObj = log.splitLogFile(log.fileObj)
+		// 将日志写到管道中
+		logm := &LogMsg{
+			level:     level,
+			message:   msg,
+			funcname:  funcname,
+			filename:  filename,
+			timestamp: time.Now().Format("2006-01-02 15:03:04"),
+			line:      line,
 		}
-		fmt.Fprintf(log.fileObj, "[%s] [%s] [%s:%s:%d] %s\n", new.Format("2006-01-02 15:03:04"), levelName(level), filename, funcname, line, msg)
-		if level >= ERROR {
-			// 判断日志大小是否已经超过规定大小
-			if log.checkFileSize(log.errFileObj) {
-				// 切分日志
-				log.errFileObj = log.splitLogFile(log.errFileObj)
-			}
-			fmt.Fprintf(log.errFileObj, "[%s] [%s] [%s:%s:%d] %s\n", new.Format("2006-01-02 15:03:04"), levelName(level), filename, funcname, line, msg)
+		select {
+		case log.logChan <- logm:
+		default:
+			// 丢弃日志
 		}
+
 	}
 }
 
@@ -123,10 +175,4 @@ func (log *FileLogger) Error(format string, a ...interface{}) {
 // Fatal 消息
 func (log *FileLogger) Fatal(format string, a ...interface{}) {
 	log.writeLog(FATAL, format, a...)
-}
-
-// Close ...
-func (log *FileLogger) Close() {
-	log.fileObj.Close()
-	log.errFileObj.Close()
 }
